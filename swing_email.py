@@ -1,168 +1,62 @@
-"""
-Plain-text email for swing trade picks.
-Formatted for easy reading at a glance.
-"""
-import logging
 import smtplib
+from datetime import date
 from email.mime.text import MIMEText
-from typing import Optional
 
-from swing_config import EMAIL_FROM, EMAIL_TO, GMAIL_APP_PASSWORD, MIN_SCORE
-from swing_data import MarketRegime
-from swing_scorer import SwingCandidate
-
-log = logging.getLogger(__name__)
-
-_LINE = "=" * 56
-_THIN = "-" * 56
+from swing_config import EMAIL_FROM, EMAIL_TO, GMAIL_APP_PASSWORD
+from swing_screener import Pick
 
 
-def build_email(
-    picks: list[SwingCandidate],
-    near_misses: list[SwingCandidate],
-    excluded: list[SwingCandidate],
-    regime: Optional[MarketRegime],
-    generated_at: str,
-) -> str:
-    lines: list[str] = []
+def build_body(picks: list[Pick], excluded: list[Pick]) -> str:
+    today = date.today().strftime("%B %d, %Y")
+    lines = [f"SWING PICKS  —  {today}", "=" * 52, ""]
 
-    lines += [
-        _LINE,
-        "  SWING TRADE PICKS",
-        f"  {generated_at}  |  Horizon: 2–14 days",
-        _LINE,
-        "",
-    ]
-
-    # Market regime
-    if regime:
-        flag = "  *** BAD REGIME — higher bar applied ***" if regime.is_bad else ""
+    if picks:
         lines += [
-            "MARKET REGIME",
-            f"  {regime.label}",
+            f"TOP {len(picks)} PICKS",
+            "Buy near today's close or tomorrow's open.",
+            "Set your stop BEFORE you enter the trade.",
+            "-" * 52,
         ]
-        if flag:
-            lines.append(flag)
-        lines.append("")
-
-    # Picks
-    if not picks:
-        lines += [
-            f"NO QUALIFIED PICKS TODAY",
-            f"(minimum score {MIN_SCORE:.0f} — nothing cleared the bar)",
-            "",
-        ]
-    else:
-        for c in picks:
-            t = c.technical
-            sf = c.sec_filing
-
+        for i, p in enumerate(picks, 1):
+            risk = p.price - p.stop
             lines += [
-                _THIN,
-                f"  #{c.rank}  {c.ticker}  —  {c.company}",
-                f"  Score: {c.score:.1f}  |  {sf.catalyst_type if sf else 'Signal'}",
+                f"#{i}  {p.ticker}  —  {p.company}",
+                f"    Price   ${p.price:.2f}   up {p.gain_pct:.1f}% today   {p.volume_ratio:.1f}x volume",
+                f"    Entry   near ${p.price:.2f}",
+                f"    Stop    ${p.stop:.2f}   (risk ${risk:.2f}/share)",
+                f"    Target  ${p.target:.2f}   ({p.rr:.1f}:1 reward-to-risk)",
+                f"    ATR     {p.atr_pct:.1f}%   Above 20-day MA: {'Yes' if p.above_ma20 else 'No'}",
+                "",
             ]
+    else:
+        lines += ["NO PICKS TODAY", "No stocks passed all filters.", ""]
 
-            if sf:
-                items_str = ", ".join(sf.items) if sf.items else "?"
-                lines.append(f"  8-K Items: {items_str}  ({sf.filed_date})")
-
-            if t:
-                lines += [
-                    "",
-                    f"  Price:   ${t.price:.2f}",
-                    f"  Stop:    ${t.stop_price:.2f}  (entry − 1.5×ATR)",
-                    f"  Target:  ${t.target_price:.2f}",
-                    f"  R:R:     {t.rr_ratio:.1f}:1",
-                    f"  ATR:     {t.atr_pct:.1f}%  |  5d: {t.momentum_5d:+.1f}%  |  20d: {t.momentum_20d:+.1f}%",
-                    f"  Volume:  {t.rel_volume:.1f}x 50-day avg",
-                    f"  MA20:    {'above' if t.above_ma20 else 'BELOW'} ({t.pct_above_ma20:+.1f}%)",
-                    f"  52w-Hi:  {t.pct_from_52w_high:+.1f}%  from ${t.high_52w:.2f}",
-                ]
-                if t.earnings_date:
-                    lines.append(f"  Earnings:{t.earnings_date}")
-
-            if c.thesis:
-                lines += ["", f"  >> {c.thesis}"]
-
-            if c.insider_buys:
-                b = c.insider_buys[0]
-                lines.append(f"  Insider: {b.insider_name} — {b.shares:,} sh @ ${b.price:.2f}")
-
-            if c.news and c.news.headlines:
-                lines += ["", "  News:"]
-                for h in c.news.headlines[:2]:
-                    lines.append(f"    • {h[:70]}")
-
-            lines.append("")
-
-    # Near-misses
-    if near_misses:
-        lines += [_THIN, "  NEAR-MISSES (scored but below threshold)", _THIN]
-        for c in near_misses:
-            t = c.technical
-            lines.append(
-                f"  {c.ticker:6s}  score {c.score:.1f}  "
-                f"{'$'+str(round(t.price,2)) if t else ''}  "
-                f"{c.sec_filing.catalyst_type if c.sec_filing else ''}"
-            )
-        lines.append("")
-
-    # Exclusion log
     if excluded:
-        lines += [_THIN, "  EXCLUDED TODAY", _THIN]
-        for c in excluded:
-            lines.append(f"  {c.ticker:6s}  {c.exclude_reason[:60]}")
+        lines += [f"SCREENED OUT  ({len(excluded)} stocks)", "-" * 52]
+        for p in excluded[:12]:
+            lines.append(f"  {p.ticker:<6}  ${p.price:.2f}  +{p.gain_pct:.1f}%  —  {p.exclude_reason}")
         lines.append("")
 
     lines += [
-        _LINE,
-        "Educational only. Not financial advice. Do your own research.",
-        _LINE,
+        "─" * 52,
+        "Never risk more than 1–2% of your account on one trade.",
+        "Take partial profits at 1:1 R:R. Cut losses at your stop.",
     ]
-
     return "\n".join(lines)
 
 
-def send_swing_email(
-    picks: list[SwingCandidate],
-    near_misses: list[SwingCandidate],
-    excluded: list[SwingCandidate],
-    regime: Optional[MarketRegime],
-    generated_at: str,
-    dry_run: bool = False,
-) -> None:
-    body = build_email(picks, near_misses, excluded, regime, generated_at)
-
-    if dry_run:
-        print(body)
-        log.info("[dry-run] email not sent")
-        return
-
-    if not EMAIL_FROM or not GMAIL_APP_PASSWORD:
-        log.warning("GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping email")
-        print(body)
-        return
-
-    n_picks = len(picks)
+def send_picks(picks: list[Pick], excluded: list[Pick]) -> None:
+    today = date.today().strftime("%Y-%m-%d")
+    n = len(picks)
     subject = (
-        f"Swing Picks — {n_picks} qualified — {generated_at}"
-        if n_picks else
-        f"Swing Picks — No candidates today — {generated_at}"
+        f"Swing Picks {today} — {n} pick{'s' if n != 1 else ''}"
+        if n else f"Swing Picks {today} — No picks today"
     )
-
-    msg = MIMEText(body, "plain")
+    body = build_body(picks, excluded)
+    msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
-
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
-            smtp.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        log.info("Email sent to %s (%d picks)", EMAIL_TO, n_picks)
-    except Exception as exc:
-        log.error("Email failed: %s", exc)
-        print(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_FROM, GMAIL_APP_PASSWORD)
+        smtp.send_message(msg)

@@ -1,317 +1,188 @@
 """
-Pipeline: collect candidates → apply hard filters → return for scoring.
+Simple momentum screener — buy stocks moving up today on high volume.
 
-Hard filters (any one → excluded with reason):
-  1. Routine 8-K filer (same item 3+ times in 6 weeks)
-  2. Only routine items (9.01, 5.03, 7.01 — no real catalyst)
-  3. Merger target (keyword detection + price near deal)
-  4. Non-equity instrument (ETF, preferred, warrant, SPAC, trust)
-  5. Price out of range ($5–$500)
-  6. Dollar volume < $5M/day
-  7. ATR(14) < 2% (not enough volatility for a swing)
-  8. Already moved: 5d gain > 15% or 20d gain > 25%
-  9. Risk/reward < 2:1
- 10. Earnings inside hold window (unless earnings IS the catalyst)
- 11. Re-flagged within 10 trading days with no new catalyst
+Filters (any fail → excluded):
+  1. Price $10–$200
+  2. Avg dollar volume >= $5M/day
+  3. Up 2–12% today
+  4. Volume >= 1.5× 20-day average
+  5. Price above 20-day MA (in an uptrend)
+  6. Not already up >15% over the prior 5 days
 
-Fallback: if SEC yields < 5 candidates, supplement with Yahoo movers.
+Scoring rewards: volume surge + gain in sweet spot (3–8%) + volatility + near 52w high
 """
-import csv
 import logging
-import os
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+
+import pandas as pd
+import requests
+import yfinance as yf
 
 from swing_config import (
-    MIN_PRICE, MAX_PRICE, MIN_AVG_DOLLAR_VOLUME, MIN_ATR_PCT,
-    MAX_5D_GAIN_PCT, MAX_20D_GAIN_PCT,
-    MIN_RR, FRESHNESS_TRADING_DAYS, ROUTINE_ITEMS,
-    BAD_REGIME_SCORE_BUMP, MIN_SCORE,
+    ATR_STOP_MULT, MAX_5D_PRIOR_GAIN, MAX_GAIN_PCT,
+    MAX_PRICE, MIN_AVG_DOLLAR_VOL, MIN_GAIN_PCT,
+    MIN_PRICE, MIN_VOLUME_RATIO, NUM_PICKS, RR_TARGET,
 )
-from swing_data import (
-    get_sec_catalysts, get_insider_buys, get_yahoo_movers,
-    get_technical_signal, get_yahoo_news, analyze_with_claude,
-    is_merger_target, is_near_deal_price,
-    MarketRegime, TechnicalSignal,
-    EXCLUDED_NAME_RE, EXCLUDED_QUOTE_TYPES,
-)
-from swing_scorer import SwingCandidate
 
 log = logging.getLogger(__name__)
 
-PICKS_LOG = "picks_log.csv"
 
-_SKIP_TICKERS = {
-    "BTC-USD", "ETH-USD", "^GSPC", "^DJI", "^IXIC", "^VIX", "^RUT",
-}
+@dataclass
+class Pick:
+    ticker: str
+    company: str
+    price: float
+    gain_pct: float
+    volume_ratio: float
+    stop: float
+    target: float
+    rr: float
+    atr_pct: float
+    above_ma20: bool
+    score: float = 0.0
+    excluded: bool = False
+    exclude_reason: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Recent picks log — freshness check
-# ---------------------------------------------------------------------------
-
-def _load_recent_picks(trading_days: int = FRESHNESS_TRADING_DAYS) -> set[str]:
-    """Return tickers picked in the last `trading_days` calendar days (~2 weeks)."""
-    if not os.path.exists(PICKS_LOG):
-        return set()
-    cutoff = datetime.now() - timedelta(days=trading_days * 1.5)
-    seen: set[str] = set()
+def _get_yahoo_gainers() -> list[str]:
+    url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    params = {"formatted": "false", "scrIds": "day_gainers", "count": 50}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        with open(PICKS_LOG, newline="") as f:
-            for row in csv.DictReader(f):
-                try:
-                    d = datetime.strptime(row["date"], "%Y-%m-%d")
-                    if d >= cutoff and row.get("excluded") != "1":
-                        seen.add(row["ticker"])
-                except (ValueError, KeyError):
-                    continue
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        quotes = r.json()["finance"]["result"][0]["quotes"]
+        return [q["symbol"] for q in quotes if "symbol" in q]
     except Exception as exc:
-        log.debug("picks_log read: %s", exc)
-    return seen
+        log.warning("Yahoo gainers fetch failed: %s", exc)
+        return []
 
 
-def append_to_log(candidates: list[SwingCandidate], run_date: str) -> None:
-    """Append all candidates (picks + near-misses + excluded) to picks_log.csv."""
-    write_header = not os.path.exists(PICKS_LOG)
+def _analyze(ticker: str) -> Pick | None:
     try:
-        with open(PICKS_LOG, "a", newline="") as f:
-            fieldnames = [
-                "date", "ticker", "company", "score", "rank",
-                "catalyst", "items", "price", "stop", "target", "rr",
-                "atr_pct", "mom5d", "mom20d", "above_ma20",
-                "earnings_date", "excluded", "exclude_reason",
-                "ret_2d", "ret_5d", "ret_10d",   # filled in later
-            ]
-            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            if write_header:
-                w.writeheader()
-            for c in candidates:
-                t = c.technical
-                sf = c.sec_filing
-                w.writerow({
-                    "date": run_date,
-                    "ticker": c.ticker,
-                    "company": c.company,
-                    "score": c.score,
-                    "rank": c.rank,
-                    "catalyst": sf.catalyst_type if sf else "",
-                    "items": ",".join(sf.items) if sf else "",
-                    "price": t.price if t else "",
-                    "stop": t.stop_price if t else "",
-                    "target": t.target_price if t else "",
-                    "rr": t.rr_ratio if t else "",
-                    "atr_pct": t.atr_pct if t else "",
-                    "mom5d": t.momentum_5d if t else "",
-                    "mom20d": t.momentum_20d if t else "",
-                    "above_ma20": (1 if t and t.above_ma20 else 0) if t else "",
-                    "earnings_date": t.earnings_date if t else "",
-                    "excluded": 1 if c.excluded else 0,
-                    "exclude_reason": c.exclude_reason,
-                    "ret_2d": "", "ret_5d": "", "ret_10d": "",
-                })
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="65d")
+        if len(hist) < 22:
+            return None
+
+        info = tk.fast_info
+        price = float(getattr(info, "last_price", None) or hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
+        gain_pct = (price - prev_close) / prev_close * 100
+
+        # Volume
+        today_vol = float(hist["Volume"].iloc[-1])
+        avg_vol_20 = float(hist["Volume"].iloc[-21:-1].mean())
+        vol_ratio = today_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
+
+        # Dollar volume
+        avg_close_20 = float(hist["Close"].iloc[-21:-1].mean())
+        avg_dollar_vol = avg_close_20 * avg_vol_20
+
+        # 20-day MA (exclude today)
+        ma20 = avg_close_20
+        above_ma20 = price > ma20
+
+        # ATR(14)
+        tr = pd.concat([
+            hist["High"] - hist["Low"],
+            (hist["High"] - hist["Close"].shift(1)).abs(),
+            (hist["Low"] - hist["Close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr14 = float(tr.iloc[-15:-1].mean())
+        atr_pct = atr14 / price * 100 if price > 0 else 0.0
+
+        # Stop / target
+        today_low = float(hist["Low"].iloc[-1])
+        stop = max(today_low, price - ATR_STOP_MULT * atr14)
+        risk = price - stop
+        if risk <= 0:
+            return None
+        target = price + RR_TARGET * risk
+        rr = round((target - price) / risk, 2)
+
+        # Prior 5-day gain (before today)
+        price_5d_ago = float(hist["Close"].iloc[-7]) if len(hist) >= 7 else prev_close
+        prior_5d_gain = (prev_close - price_5d_ago) / price_5d_ago * 100
+
+        company = getattr(info, "long_name", None) or ticker
+
+        p = Pick(
+            ticker=ticker,
+            company=company,
+            price=round(price, 2),
+            gain_pct=round(gain_pct, 2),
+            volume_ratio=round(vol_ratio, 2),
+            stop=round(stop, 2),
+            target=round(target, 2),
+            rr=rr,
+            atr_pct=round(atr_pct, 2),
+            above_ma20=above_ma20,
+        )
+
+        # --- Hard filters ---
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            p.excluded, p.exclude_reason = True, f"price ${price:.2f} outside ${MIN_PRICE}–${MAX_PRICE}"
+            return p
+        if avg_dollar_vol < MIN_AVG_DOLLAR_VOL:
+            p.excluded, p.exclude_reason = True, f"avg dollar vol ${avg_dollar_vol/1e6:.1f}M < $5M"
+            return p
+        if gain_pct < MIN_GAIN_PCT:
+            p.excluded, p.exclude_reason = True, f"only up {gain_pct:.1f}% today"
+            return p
+        if gain_pct > MAX_GAIN_PCT:
+            p.excluded, p.exclude_reason = True, f"already up {gain_pct:.1f}% today (too extended)"
+            return p
+        if vol_ratio < MIN_VOLUME_RATIO:
+            p.excluded, p.exclude_reason = True, f"volume {vol_ratio:.1f}x avg (need {MIN_VOLUME_RATIO}x)"
+            return p
+        if not above_ma20:
+            p.excluded, p.exclude_reason = True, f"below 20MA ${ma20:.2f} (downtrend)"
+            return p
+        if prior_5d_gain > MAX_5D_PRIOR_GAIN:
+            p.excluded, p.exclude_reason = True, f"already up {prior_5d_gain:.1f}% prior 5 days"
+            return p
+
+        # --- Score ---
+        # Volume surge (cap at 5x → 2.5 pts)
+        vol_score = min(vol_ratio / 2.0, 2.5)
+        # Gain quality: sweet spot 3–8%
+        if 3.0 <= gain_pct <= 8.0:
+            gain_score = 2.5
+        elif gain_pct < 3.0:
+            gain_score = gain_pct / 3.0 * 2.5
+        else:
+            gain_score = max(0.0, 2.5 - (gain_pct - 8.0) * 0.3)
+        # Volatility (ATR): more volatile = better swing candidate (cap at 2.5 pts)
+        atr_score = min(atr_pct / 3.0 * 1.5, 1.5)
+        # Not too extended from 52w high (max 1.5 pts)
+        high_52w = float(hist["High"].max())
+        pct_from_high = (price - high_52w) / high_52w * 100  # negative number
+        ext_score = 1.5 if pct_from_high > -10 else max(0.0, 1.5 + pct_from_high * 0.1)
+
+        p.score = round(vol_score + gain_score + atr_score + ext_score, 2)
+        return p
+
     except Exception as exc:
-        log.warning("picks_log write: %s", exc)
+        log.debug("%s analysis failed: %s", ticker, exc)
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Hard filter helpers
-# ---------------------------------------------------------------------------
+def run_screen() -> tuple[list[Pick], list[Pick]]:
+    tickers = _get_yahoo_gainers()
+    log.info("Fetched %d gainers from Yahoo", len(tickers))
 
-def _is_only_routine_items(items: list[str]) -> bool:
-    """True if ALL items are routine (no real catalyst)."""
-    if not items:
-        return False
-    return all(item in ROUTINE_ITEMS for item in items)
-
-
-def _is_excluded_instrument(t: TechnicalSignal) -> tuple[bool, str]:
-    if t.quote_type in EXCLUDED_QUOTE_TYPES:
-        return True, f"non-equity instrument ({t.quote_type})"
-    if EXCLUDED_NAME_RE.search(t.long_name):
-        return True, f"excluded by name pattern ({t.long_name[:40]})"
-    return False, ""
-
-
-def _earnings_in_window(earnings_date: str, hold_days: int = 14) -> bool:
-    try:
-        ed = datetime.strptime(earnings_date[:10], "%Y-%m-%d")
-        days_away = (ed - datetime.now()).days
-        return 0 <= days_away <= hold_days
-    except (ValueError, TypeError):
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Main screener
-# ---------------------------------------------------------------------------
-
-def run_swing_screen(regime: MarketRegime = None) -> list[SwingCandidate]:
-    recent_picks = _load_recent_picks()
-    effective_min_score = MIN_SCORE + (BAD_REGIME_SCORE_BUMP if regime and regime.is_bad else 0)
-    if regime and regime.is_bad:
-        log.info("Bad market regime — min score raised to %.1f", effective_min_score)
-
-    # --- Primary: SEC 8-K + insider ---
-    log.info("Fetching SEC 8-K catalysts...")
-    sec_filings = get_sec_catalysts()
-    log.info("Fetching insider buys...")
-    insider_buys = get_insider_buys()
-
-    primary = set(sec_filings.keys()) | set(insider_buys.keys())
-    log.info("Primary pool: %d tickers", len(primary))
-
-    # --- Fallback: Yahoo movers ---
-    fallback: set[str] = set()
-    if len(primary) < 5:
-        log.info("Small primary pool — adding Yahoo movers fallback")
-        movers = get_yahoo_movers(30)
-        fallback = {t for t in movers if t not in _SKIP_TICKERS and "-" not in t and "^" not in t}
-        log.info("Fallback: %d movers", len(fallback))
-
-    all_tickers = primary | fallback
-    log.info("Total candidates to evaluate: %d", len(all_tickers))
-
-    candidates: list[SwingCandidate] = []
-
-    for ticker in sorted(all_tickers):
-        if "-" in ticker or "^" in ticker:
+    all_picks: list[Pick] = []
+    for ticker in tickers:
+        if any(c in ticker for c in ("-", "^", "/")):
             continue
+        p = _analyze(ticker)
+        if p:
+            all_picks.append(p)
+        time.sleep(0.15)
 
-        sec_f = sec_filings.get(ticker)
-        ibuys = insider_buys.get(ticker, [])
-        company = sec_f.company if sec_f else ticker
+    passed = sorted([p for p in all_picks if not p.excluded], key=lambda x: x.score, reverse=True)
+    excluded = [p for p in all_picks if p.excluded]
 
-        c = SwingCandidate(ticker=ticker, company=company, sec_filing=sec_f, insider_buys=ibuys)
-
-        # --- Hard filter 1: routine filer ---
-        if sec_f and sec_f.is_routine_filer:
-            c.excluded = True
-            c.exclude_reason = f"routine filer — {sec_f.routine_reason}"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 2: only routine items ---
-        if sec_f and _is_only_routine_items(sec_f.items):
-            c.excluded = True
-            c.exclude_reason = f"routine items only ({', '.join(sec_f.items)})"
-            candidates.append(c)
-            continue
-
-        # --- Fetch news (needed for merger check) ---
-        news = get_yahoo_news(ticker)
-        c.news = news
-        headlines = news.headlines if news else []
-
-        # --- Hard filter 3: merger target ---
-        if is_merger_target(ticker, headlines):
-            c.excluded = True
-            c.exclude_reason = "merger/acquisition target (keyword match)"
-            candidates.append(c)
-            continue
-
-        # --- Technical data ---
-        tech = get_technical_signal(ticker)
-        c.technical = tech
-        c.company = company if company != ticker else (tech.long_name if tech else ticker)
-
-        if not tech:
-            log.debug("No technical data for %s", ticker)
-            # Keep candidate but mark as low quality (no tech = can't filter properly)
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 3b: near deal price ---
-        if is_near_deal_price(tech.price, headlines):
-            c.excluded = True
-            c.exclude_reason = f"price ${tech.price:.2f} near cash deal price"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 4: non-equity instrument ---
-        is_excl, excl_reason = _is_excluded_instrument(tech)
-        if is_excl:
-            c.excluded = True
-            c.exclude_reason = excl_reason
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 5: price range ---
-        if not (MIN_PRICE <= tech.price <= MAX_PRICE):
-            c.excluded = True
-            c.exclude_reason = f"price ${tech.price:.2f} outside ${MIN_PRICE}–${MAX_PRICE}"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 6: dollar volume ---
-        if tech.avg_dollar_volume < MIN_AVG_DOLLAR_VOLUME:
-            c.excluded = True
-            c.exclude_reason = f"avg dollar vol ${tech.avg_dollar_volume/1e6:.1f}M < $5M"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 7: ATR floor ---
-        if tech.atr_pct < MIN_ATR_PCT:
-            c.excluded = True
-            c.exclude_reason = f"ATR {tech.atr_pct:.1f}% < {MIN_ATR_PCT}% (too flat)"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 8: already moved ---
-        if tech.momentum_5d > MAX_5D_GAIN_PCT:
-            c.excluded = True
-            c.exclude_reason = f"already up {tech.momentum_5d:.1f}% in 5 days"
-            candidates.append(c)
-            continue
-        if tech.momentum_20d > MAX_20D_GAIN_PCT:
-            c.excluded = True
-            c.exclude_reason = f"already up {tech.momentum_20d:.1f}% in 20 days"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 9: R:R ---
-        if tech.rr_ratio < MIN_RR:
-            c.excluded = True
-            c.exclude_reason = f"R:R {tech.rr_ratio:.1f}:1 < {MIN_RR}:1 required"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 10: earnings in hold window ---
-        earnings_is_catalyst = sec_f and "Earnings" in sec_f.catalyst_type
-        if (tech.earnings_date and
-                _earnings_in_window(tech.earnings_date) and
-                not earnings_is_catalyst):
-            c.excluded = True
-            c.exclude_reason = f"earnings {tech.earnings_date} inside 14-day hold window"
-            candidates.append(c)
-            continue
-
-        # --- Hard filter 11: freshness ---
-        if ticker in recent_picks and not sec_f:
-            c.excluded = True
-            c.exclude_reason = f"picked recently (within {FRESHNESS_TRADING_DAYS} trading days)"
-            candidates.append(c)
-            continue
-
-        # --- Claude narrative (optional) ---
-        if news and sec_f and USE_CLAUDE_API_flag():
-            score, thesis = analyze_with_claude(
-                ticker, c.company, headlines, sec_f.catalyst_type
-            )
-            news.sentiment_score = score
-            news.thesis = thesis
-
-        candidates.append(c)
-        time.sleep(0.2)
-
-    log.info(
-        "Screener done: %d total | %d passed filters | %d excluded",
-        len(candidates),
-        sum(1 for c in candidates if not c.excluded),
-        sum(1 for c in candidates if c.excluded),
-    )
-    return candidates
-
-
-def USE_CLAUDE_API_flag() -> bool:
-    from swing_config import USE_CLAUDE_API
-    return USE_CLAUDE_API
+    log.info("Done: %d passed filters, %d excluded", len(passed), len(excluded))
+    return passed[:NUM_PICKS], excluded
