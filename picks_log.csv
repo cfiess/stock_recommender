@@ -1,1 +1,2 @@
 date,ticker,company,entry_price,stop_atr,target_atr,stop_structural,target_structural,rr_atr,rr_structural,score,gain_pct_day,volume_ratio,atr_pct,ma20,ma50,rsi14,earnings_date,sector,ret_2d,ret_5d,ret_10d,max_gain_5d,max_dd_5d,stop_hit,target_hit,outcome
+2026-10-01,INFY,Infosys Limited,11.39,11.12,11.94,11.34,12.19,2.0,16.0,4.95,5.81,1.6,2.4,11.05,11.63,55.7,2026-10-23,Technology,,,,,,,,
